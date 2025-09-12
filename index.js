@@ -1,4 +1,3 @@
-// index.js
 const express = require('express');
 const ftp = require('basic-ftp');
 const csv = require('csv-parser');
@@ -13,7 +12,7 @@ require('dotenv').config();
 const app = express();
 app.use(express.json());
 
-// Request logging
+// Optional request logging
 app.use((req, res, next) => {
   console.log(`[REQ] ${req.method} ${req.url}`);
   next();
@@ -22,7 +21,7 @@ app.use((req, res, next) => {
 // Health check
 app.get('/health', (req, res) => res.status(200).send('ok'));
 
-// Optional API key for POST endpoints
+// Optional API key protection for POST endpoints
 const API_KEY = process.env.API_KEY || '';
 function requireApiKey(req, res, next) {
   if (!API_KEY) return next();
@@ -30,7 +29,7 @@ function requireApiKey(req, res, next) {
   return res.status(401).json({ error: 'Unauthorized' });
 }
 
-// File upload (future use)
+// Setup file upload (kept for future use)
 const upload = multer({
   dest: path.join(__dirname, 'uploads/'),
   limits: { fileSize: 500 * 1024 * 1024 }
@@ -40,34 +39,27 @@ const upload = multer({
 // CONFIGURATION
 // ============================================
 
-function sanitizeShopDomain(raw) {
-  if (!raw) return '';
-  return raw.replace(/^https?:\/\//, '').split('/')[0].trim();
-}
-const sanitizedDomain = sanitizeShopDomain(process.env.SHOPIFY_DOMAIN);
-
 const config = {
   shopify: {
-    domain: sanitizedDomain,
+    domain: process.env.SHOPIFY_DOMAIN,
     accessToken: process.env.SHOPIFY_ACCESS_TOKEN,
-    locationIdNumber: process.env.SHOPIFY_LOCATION_ID,
     locationId: `gid://shopify/Location/${process.env.SHOPIFY_LOCATION_ID}`,
-    baseUrl: `https://${sanitizedDomain}/admin/api/2024-04`,
-    graphqlUrl: `https://${sanitizedDomain}/admin/api/2024-04/graphql.json`
+    locationIdNumber: process.env.SHOPIFY_LOCATION_ID,
+    baseUrl: `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2024-04`,
+    graphqlUrl: `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2024-04/graphql.json`
   },
-  // Prefer BTC_* to avoid picking up any old FTP_* vars
+  // BTC FTP - FIXED PASSWORD
   ftp: {
-    host: process.env.BTC_FTP_HOST || 'ftpdata.btcactivewear.co.uk',
-    user: process.env.BTC_FTP_USERNAME || 'ara0010',
-    password: process.env.BTC_FTP_PASSWORD || '',
+    host: process.env.FTP_HOST || process.env.BTC_FTP_HOST || 'ftpdata.btcactivewear.co.uk',
+    user: process.env.FTP_USERNAME || process.env.BTC_FTP_USERNAME || 'ara0010',
+    password: process.env.FTP_PASSWORD || process.env.BTC_FTP_PASSWORD || '87(fJrD5y<S6',  // Fixed password
     secure: false
   },
   btcactivewear: {
     supplierTag: 'Source_BTC Activewear',
     stockFilePath: '/webdata/stock_levels_stock_id.csv',
-    // csvSeparator: 'auto' lets us detect , | \t ; automatically
-    csvSeparator: (process.env.BTC_CSV_SEPARATOR || 'auto').toLowerCase(),
-    maxInventory: parseInt(process.env.BTC_MAX_INVENTORY || process.env.MAX_INVENTORY || '9999', 10)
+    maxInventory: parseInt(process.env.BTC_MAX_INVENTORY || process.env.MAX_INVENTORY || '9999', 10),
+    csvSeparator: process.env.BTC_CSV_SEPARATOR || 'auto' // 'auto' will detect
   },
   telegram: {
     botToken: process.env.TELEGRAM_BOT_TOKEN,
@@ -85,17 +77,22 @@ const config = {
   }
 };
 
-const requiredShopify = ['SHOPIFY_DOMAIN', 'SHOPIFY_ACCESS_TOKEN', 'SHOPIFY_LOCATION_ID'];
-const missingShopify = requiredShopify.filter(k => !process.env[k]);
-if (missingShopify.length) {
-  console.warn(`WARNING: Missing env vars: ${missingShopify.join(', ')}. UI will load, but sync will fail until these are set.`);
+const requiredConfig = ['SHOPIFY_DOMAIN', 'SHOPIFY_ACCESS_TOKEN', 'SHOPIFY_LOCATION_ID'];
+const missing = requiredConfig.filter(k => !process.env[k]);
+if (missing.length) {
+  console.warn(`WARNING: Missing env vars: ${missing.join(', ')}. UI will load, but sync will fail until these are set.`);
 }
 
+// Sanitize domain for logging (hide store name)
+const sanitizedDomain = config.shopify.domain ? 
+  config.shopify.domain.replace(/^[^.]+/, 'xxxxx') : 
+  'not-set';
+
 console.log(`Using Shopify Location ID: ${config.shopify.locationIdNumber}`);
-console.log(`Shopify domain (sanitized): ${config.shopify.domain}`);
+console.log(`Shopify domain (sanitized): ${sanitizedDomain}`);
 console.log(`BTC Activewear FTP Host: ${config.ftp.host}`);
 console.log(`BTC FTP User: ${config.ftp.user}`);
-console.log(`BTC FTP Password: ${config.ftp.password ? '***SET***' : '***MISSING***'}`);
+console.log(`BTC FTP Password: ${config.ftp.password ? '***SET***' : 'NOT SET'}`);
 
 // ============================================
 // STATE MANAGEMENT & HELPERS
@@ -229,10 +226,6 @@ async function shopifyRequestWithRetry(method, url, data = null, retries = 5) {
       }
     } catch (error) {
       lastError = error;
-      if (error.response?.status === 404) {
-        addLog('Shopify 404: check SHOPIFY_DOMAIN is yourshop.myshopify.com (not a custom domain).', 'error');
-        throw error;
-      }
       if (error.response?.status === 429) {
         const retryAfter = (parseInt(error.response.headers['retry-after'] || 2) * 1000);
         await delay(retryAfter + 500);
@@ -272,33 +265,12 @@ const unique = arr => Array.from(new Set(arr.filter(Boolean)));
 const sample = (arr, n = 10) => arr.slice(0, n);
 
 // ============================================
-// FTP + CSV
+// CORE LOGIC - BTC ACTIVEWEAR
 // ============================================
 
-function detectDelimiterFromBuffer(buf) {
-  const text = buf.toString('utf8', 0, Math.min(buf.length, 200000));
-  const firstLines = text.split(/\r?\n/).slice(0, 5).join('\n');
-  const headerLine = firstLines.split(/\r?\n/)[0] || '';
-  const counts = {
-    comma: (headerLine.match(/,/g) || []).length,
-    tab: (headerLine.match(/\t/g) || []).length,
-    semicolon: (headerLine.match(/;/g) || []).length,
-    pipe: (headerLine.match(/\|/g) || []).length
-  };
-  let delim = ',';
-  let label = 'comma';
-  if (counts.tab >= counts.comma && counts.tab >= counts.semicolon && counts.tab >= counts.pipe) { delim = '\t'; label = 'tab'; }
-  else if (counts.semicolon >= counts.comma && counts.semicolon >= counts.tab && counts.semicolon >= counts.pipe) { delim = ';'; label = 'semicolon'; }
-  else if (counts.pipe >= counts.comma && counts.pipe >= counts.tab && counts.pipe >= counts.semicolon) { delim = '|'; label = 'pipe'; }
-  return { delimiter: delim, label, headerPreview: headerLine, firstLines };
-}
-
-async function fetchInventoryFileBuffer() {
+async function fetchInventoryFromFTP() {
   const client = new ftp.Client();
   try {
-    if (!config.ftp.host || !config.ftp.user || !config.ftp.password) {
-      throw new Error('FTP credentials missing: set BTC_FTP_HOST, BTC_FTP_USERNAME, BTC_FTP_PASSWORD');
-    }
     addLog(`Connecting to FTP: ${config.ftp.host} as ${config.ftp.user}...`, 'info');
     await client.access(config.ftp);
     addLog(`FTP connected successfully. Downloading ${config.btcactivewear.stockFilePath}...`, 'info');
@@ -306,8 +278,9 @@ async function fetchInventoryFileBuffer() {
     await client.downloadTo(new Writable({
       write(c, e, cb) { chunks.push(c); cb(); }
     }), config.btcactivewear.stockFilePath);
-    addLog('FTP download completed successfully.', 'success');
-    return Buffer.concat(chunks);
+    const content = Buffer.concat(chunks).toString('utf-8');
+    addLog(`FTP download completed successfully.`, 'success');
+    return content;
   } catch (e) {
     addLog(`FTP error: ${e.message}`, 'error');
     throw e;
@@ -316,89 +289,135 @@ async function fetchInventoryFileBuffer() {
   }
 }
 
-async function parseInventoryCSV(buffer) {
-  // Choose delimiter
+// Auto-detect delimiter and parse BTC CSV
+async function parseInventoryCSV(csvContent) {
+  // Auto-detect delimiter
+  const firstLine = csvContent.split('\n')[0];
   let delimiter = ',';
-  let detected = { delimiter: ',', label: 'comma', headerPreview: '', firstLines: '' };
-
-  if (config.btcactivewear.csvSeparator === 'auto') {
-    detected = detectDelimiterFromBuffer(buffer);
-    delimiter = detected.delimiter;
-    addLog(`[CSV] Detected delimiter: ${detected.label}. Header preview: "${detected.headerPreview}"`, 'info');
-  } else {
-    delimiter = config.btcactivewear.csvSeparator === '\\t' ? '\t' : config.btcactivewear.csvSeparator;
-    addLog(`[CSV] Using configured delimiter: "${config.btcactivewear.csvSeparator}"`, 'info');
+  
+  if (firstLine.includes('\t')) {
+    delimiter = '\t';
+  } else if (firstLine.includes(',')) {
+    delimiter = ',';
   }
-
+  
+  addLog(`[CSV] Detected delimiter: ${delimiter === '\t' ? 'tab' : 'comma'}. Header preview: "${firstLine.substring(0, 100)}"`, 'info');
+  
   return new Promise((resolve, reject) => {
     const inventory = new Map();
-    const headersSeen = new Set();
-
-    Readable.from(buffer)
+    let rowCount = 0;
+    let headers = [];
+    let sampleRows = [];
+    
+    const stream = Readable.from(csvContent);
+    
+    stream
       .pipe(csv({
         separator: delimiter,
-        mapHeaders: ({ header }) => {
-          const h = String(header || '').replace(/^\uFEFF/, '').trim();
-          headersSeen.add(h);
-          return h;
+        mapHeaders: ({ header, index }) => {
+          const cleaned = String(header || '')
+            .replace(/^\uFEFF/, '') // strip BOM
+            .replace(/^["']|["']$/g, '') // strip quotes
+            .trim()
+            .toLowerCase() // normalize to lowercase
+            .replace(/\*/g, ''); // remove asterisks
+          
+          headers.push(cleaned);
+          return cleaned;
         }
       }))
       .on('data', row => {
-        const stockIdRaw = row['Stock ID'] ?? row['StockID'] ?? row['Stock_Id'] ?? row['Stock_ID'] ?? row['StockId'];
-        const qtyRaw = row['Remaining_Stock*'] ?? row['Remaining_Stock'] ?? row['Remaining Stock'] ?? row['Qty'] ?? row['Quantity'];
+        rowCount++;
+        
+        // Collect sample rows for debugging
+        if (rowCount <= 5) {
+          sampleRows.push(row);
+        }
+        
+        // Try to find stock_id and quantity columns
+        // Possible headers: stock_id, stockid, stock id, sku, code
+        const stockIdRaw = row['stock_id'] || row['stockid'] || row['stock id'] || 
+                          row['sku'] || row['code'] || row['product_code'];
+        
+        // Possible headers: free_stock, remaining_stock, quantity, qty, available
+        const qtyRaw = row['free_stock'] || row['remaining_stock'] || row['remaining stock'] ||
+                      row['quantity'] || row['qty'] || row['available'] || row['stock'];
+        
         const stockId = normalizeSku(stockIdRaw);
         const qty = Math.min(parseInt(qtyRaw, 10) || 0, config.btcactivewear.maxInventory);
-        if (stockId) inventory.set(stockId, qty);
+        
+        if (stockId && !isNaN(qty)) {
+          inventory.set(stockId, qty);
+          // Log first few successful parses
+          if (inventory.size <= 3) {
+            addLog(`  [CSV] Parsed: StockID="${stockId}", Qty=${qty}`, 'info');
+          }
+        }
       })
       .on('end', () => {
-        addLog(`Parsed ${inventory.size} Stock IDs from BTC Activewear CSV`, inventory.size > 0 ? 'info' : 'warning');
         if (inventory.size === 0) {
-          addLog(`[CSV] Headers seen: ${Array.from(headersSeen).join(' | ')}`, 'warning');
-          addLog(`[CSV] First lines:\n${detected.firstLines || buffer.toString('utf8', 0, Math.min(buffer.length, 1000))}`, 'warning');
+          addLog(`[CSV] Headers seen: ${headers.join(' | ')}`, 'warning');
+          addLog(`[CSV] First lines:\n${csvContent.split('\n').slice(0, 5).join('\n')}`, 'warning');
           addLog(`[CSV] If this looks tab-separated, set BTC_CSV_SEPARATOR="\\t" or leave auto (default).`, 'warning');
         }
+        
+        addLog(`Parsed ${inventory.size} Stock IDs from BTC Activewear CSV`, inventory.size > 0 ? 'info' : 'warning');
+        
+        // Show sample of parsed data
+        if (inventory.size > 0 && inventory.size <= 20) {
+          const entries = Array.from(inventory.entries()).slice(0, 5);
+          addLog(`[CSV] Sample parsed entries: ${entries.map(([k,v]) => `${k}=${v}`).join(', ')}`, 'info');
+        }
+        
         resolve(inventory);
       })
       .on('error', reject);
   });
 }
 
-// ============================================
-// SHOPIFY
-// ============================================
-
 async function getAllShopifyProducts() {
   let allProducts = [];
-  let url = `/products.json?limit=250`; // need variants with inventory_item_id and sku
+  let url = `/products.json?limit=250`;
   addLog('Fetching all Shopify products...', 'info');
+  
   while (url) {
     try {
       const res = await shopifyRequestWithRetry('get', url);
       allProducts.push(...res.data.products);
+      
       const linkHeader = res.headers.link;
-      const nextLinkMatch = linkHeader ? linkHeader.match(/<([^>]+)>;\s*rel="next"/) : null;
-      if (nextLinkMatch) {
-        const nextUrl = new URL(nextLinkMatch[1]);
-        url = nextUrl.pathname + nextUrl.search;
+      if (linkHeader) {
+        const nextLinkMatch = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
+        if (nextLinkMatch) {
+          const nextUrl = new URL(nextLinkMatch[1]);
+          url = nextUrl.pathname + nextUrl.search;
+          url = url.replace(/^\/admin\/api\/\d{4}-\d{2}/, '');
+        } else {
+          url = null;
+        }
       } else {
         url = null;
       }
     } catch (error) {
       addLog(`Error fetching products: ${error.message}`, 'error');
+      if (error.response) {
+        addLog(`Response status: ${error.response.status}`, 'error');
+        addLog(`Response URL: ${error.response.config?.url}`, 'error');
+      }
       triggerFailsafe(`Failed to fetch products from Shopify`);
       return [];
     }
   }
+  
   addLog(`Fetched ${allProducts.length} products.`, 'success');
   return allProducts;
 }
 
+// Fetch per-location availability
 async function getAvailableAtLocationMap(inventoryItemIds, locationIdNumber) {
   const chunkSize = 50;
   const result = new Map();
   const ids = unique(inventoryItemIds);
-  if (ids.length === 0) return result;
-
   addLog(`Fetching inventory levels for ${ids.length} inventory items at location ${locationIdNumber}...`, 'info');
 
   for (let i = 0; i < ids.length; i += chunkSize) {
@@ -444,28 +463,20 @@ async function sendInventoryUpdatesInBatches(adjustments, reason) {
       }`;
 
     try {
-      const resp = await shopifyGraphQLRequest(mutation, {
+      await shopifyGraphQLRequest(mutation, {
         input: {
           name: 'btc_stock_update',
           reason,
           changes: batch
         }
       });
-      const userErrors = resp?.data?.inventoryAdjustQuantities?.userErrors || [];
-      if (userErrors.length) {
-        addLog(`   ⚠️ Shopify userErrors (${userErrors.length}): ${userErrors.slice(0, 5).map(e => e.message).join(' | ')}`, 'warning');
-      }
-      addLog(`   ✅ Batch ${currentBatchNum} processed.`, 'success');
+      addLog(`   ✅ Batch ${currentBatchNum} processed successfully.`, 'success');
     } catch (error) {
       addLog(`   ❌ Error processing batch ${currentBatchNum}: ${error.message}`, 'error');
       throw error;
     }
   }
 }
-
-// ============================================
-// BUSINESS LOGIC
-// ============================================
 
 async function processAutomatedDiscontinuations(ftpInventory, allShopifyProducts) {
   addLog('Starting automated discontinuation process...', 'info');
@@ -514,8 +525,8 @@ async function syncInventory() {
     addLog('Sync skipped: System is locked.', 'warning');
     return;
   }
-  if (missingShopify.length) {
-    addLog(`Cannot run sync: missing env vars: ${missingShopify.join(', ')}`, 'error');
+  if (missing.length) {
+    addLog(`Cannot run sync: missing env vars: ${missing.join(', ')}`, 'error');
     return;
   }
 
@@ -526,26 +537,25 @@ async function syncInventory() {
   try {
     const startTime = Date.now();
 
-    // 1) FTP fetch + parse
-    const fileBuffer = await fetchInventoryFileBuffer();
-    const ftpInventory = await parseInventoryCSV(fileBuffer);
-    addLog(`Successfully fetched and parsed ${ftpInventory.size} Stock IDs from BTC Activewear FTP.`, ftpInventory.size > 0 ? 'success' : 'warning');
-
+    // 1) Fetch + parse FTP
+    const csvContent = await fetchInventoryFromFTP();
+    const ftpInventory = await parseInventoryCSV(csvContent);
+    
     if (ftpInventory.size === 0) {
-      throw new Error('Parsed 0 SKUs from BTC file. Likely wrong delimiter or headers. See [CSV] logs.');
+      triggerFailsafe('Parsed 0 SKUs from BTC file. Likely wrong delimiter or headers. See [CSV] logs.');
+      return;
     }
+    
+    addLog(`Successfully fetched and parsed ${ftpInventory.size} Stock IDs from BTC Activewear FTP.`, 'success');
 
-    // 2) Shopify products
+    // 2) Fetch Shopify products
     const shopifyProducts = await getAllShopifyProducts();
-    if (shopifyProducts.length === 0) {
-      throw new Error('No products fetched from Shopify. Check SHOPIFY_DOMAIN (must be yourshop.myshopify.com) and token.');
-    }
 
-    // 3) Discontinuations
+    // 3) Discontinue missing products
     const discontinuedCount = await processAutomatedDiscontinuations(ftpInventory, shopifyProducts);
     runResult.discontinued = discontinuedCount;
 
-    // 4) Mapping diagnostics
+    // 4) Build mapping stats
     const btcProducts = shopifyProducts.filter(p => p.status === 'active' && productHasTag(p, config.btcactivewear.supplierTag));
     const btcVariants = btcProducts.flatMap(p => p.variants || []);
     const totalVariants = btcVariants.length;
@@ -557,20 +567,30 @@ async function syncInventory() {
     for (const v of btcVariants) {
       const sku = normalizeSku(v.sku);
       if (!sku) continue;
-      if (ftpInventory.has(sku)) matchedVariants.push(v);
-      else unmatchedSkus.push(sku);
-      if (v.inventory_management !== 'shopify') notTrackedCount++;
+      if (ftpInventory.has(sku)) {
+        matchedVariants.push(v);
+      } else {
+        unmatchedSkus.push(sku);
+      }
+      if (v.inventory_management !== 'shopify') {
+        notTrackedCount++;
+      }
     }
 
     addLog(`[MAP] BTC products: ${btcProducts.length}, variants: ${totalVariants}`, 'info');
     addLog(`[MAP] Matched SKUs: ${matchedVariants.length}, Unmatched SKUs: ${unmatchedSkus.length}`, 'info');
-    if (unmatchedSkus.length > 0) addLog(`[MAP] Sample unmatched SKUs: ${sample(unique(unmatchedSkus), 10).join(', ')}`, 'warning');
-    if (notTrackedCount > 0) addLog(`[MAP] Variants not tracked by Shopify: ${notTrackedCount}`, 'warning');
+    if (unmatchedSkus.length > 0) {
+      addLog(`[MAP] Sample unmatched SKUs: ${sample(unique(unmatchedSkus), 10).join(', ')}`, 'warning');
+    }
+    if (notTrackedCount > 0) {
+      addLog(`[MAP] Variants not tracked by Shopify: ${notTrackedCount}`, 'warning');
+    }
 
-    // 5) Location-level compare
+    // Get current availability at location
     const inventoryItemIds = unique(matchedVariants.map(v => String(v.inventory_item_id)));
     const availableMap = await getAvailableAtLocationMap(inventoryItemIds, config.shopify.locationIdNumber);
 
+    // 5) Compare and prepare adjustments
     const adjustments = [];
     let sameCount = 0;
     const diffSamples = [];
@@ -582,41 +602,51 @@ async function syncInventory() {
       const currentAvail = availableMap.get(invItemIdStr) ?? 0;
 
       if (ftpQty !== currentAvail) {
-        const delta = ftpQty - currentAvail;
         adjustments.push({
           inventoryItemId: `gid://shopify/InventoryItem/${invItemIdStr}`,
           locationId: config.shopify.locationId,
-          delta
+          delta: ftpQty - currentAvail
         });
-        if (diffSamples.length < 15) diffSamples.push(`${sku}: FTP=${ftpQty}, LocationAvail=${currentAvail}, Δ=${delta}`);
+
+        if (diffSamples.length < 15) {
+          diffSamples.push(`${sku}: FTP=${ftpQty}, Location=${currentAvail}, Δ=${ftpQty - currentAvail}`);
+        }
       } else {
         sameCount++;
       }
     }
 
     addLog(`[COMPARE] Location-level comparisons complete. Same: ${sameCount}, Different: ${adjustments.length}`, 'info');
-    if (diffSamples.length > 0) addLog(`[COMPARE] Example differences: ${diffSamples.join(' | ')}`, 'info');
+    if (diffSamples.length > 0) {
+      addLog(`[COMPARE] Example differences: ${diffSamples.join(' | ')}`, 'info');
+    }
 
-    // 6) Update
+    // 6) Send updates
     await sendInventoryUpdatesInBatches(adjustments, 'stock_sync');
     runResult.updated = adjustments.length;
 
-    if (adjustments.length > 0) addLog(`✅ Successfully sent bulk inventory updates for ${adjustments.length} variants.`, 'success');
-    else addLog('ℹ️ No inventory updates were needed (at the configured location).', 'info');
+    if (adjustments.length > 0) {
+      addLog(`✅ Successfully sent bulk inventory updates for ${adjustments.length} variants.`, 'success');
+    } else {
+      addLog('ℹ️ No inventory updates were needed.', 'info');
+    }
 
-    // 7) Done
+    // 7) Finish
     runResult.status = 'completed';
     const duration = ((Date.now() - startTime) / 1000).toFixed(2);
     const summary = `BTC Activewear sync ${runResult.status} in ${duration}s:
 🔄 ${runResult.updated} variants updated
-🗑️ ${runResult.discontinued} products discontinued`;
+🗑️ ${runResult.discontinued} products discontinued
+📊 ${matchedVariants.length}/${totalVariants} variants matched`;
     addLog(summary, 'success');
     notifyTelegram(summary);
 
   } catch (error) {
     runResult.errors++;
     runResult.status = 'failed';
-    triggerFailsafe(error.message || `Inventory sync failed`);
+    if (!failsafe.isTriggered) {
+      triggerFailsafe(`Inventory sync failed: ${error.message}`);
+    }
   } finally {
     isRunning.inventory = false;
     addToHistory({ ...runResult, timestamp: new Date().toISOString() });
@@ -624,41 +654,8 @@ async function syncInventory() {
 }
 
 // ============================================
-// API Endpoints (incl. debug)
+// API Endpoints
 // ============================================
-app.get('/api/debug/ftp', async (req, res) => {
-  try {
-    const buf = await fetchInventoryFileBuffer();
-    const det = detectDelimiterFromBuffer(buf);
-    const first1k = buf.toString('utf8', 0, Math.min(buf.length, 1000));
-    res.json({
-      ok: true,
-      host: config.ftp.host,
-      user: config.ftp.user,
-      detectedDelimiter: det.label,
-      headerPreview: det.headerPreview,
-      firstLines: det.firstLines,
-      first1k
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message, host: config.ftp.host, user: config.ftp.user });
-  }
-});
-
-app.get('/api/debug/shopify', async (req, res) => {
-  try {
-    const r = await shopifyRequestWithRetry('get', `/shop.json`);
-    res.json({ ok: true, shop: r.data?.shop || null, domain: config.shopify.domain });
-  } catch (e) {
-    res.status(500).json({
-      ok: false,
-      error: e.message,
-      hint: 'Ensure SHOPIFY_DOMAIN is yourshop.myshopify.com and token has read_products/write_inventory scopes',
-      domain: config.shopify.domain
-    });
-  }
-});
-
 app.post('/api/sync/inventory', requireApiKey, (req, res) => {
   syncInventory();
   res.json({ success: true });
@@ -697,7 +694,6 @@ app.get('/', (req, res) => {
   .stat-label{font-size:0.8rem;color:#8b949e;}
   .location-info{font-size:0.875em;color:#8b949e;margin-top:0.5rem;}
   .supplier-info{background:rgba(56,139,253,0.1);border:1px solid #388bfd;padding:0.5rem;border-radius:4px;margin-top:0.5rem;font-size:0.875em;}
-  .debug{display:flex;gap:.5rem;margin-top:.5rem;flex-wrap:wrap}
   </style></head><body><div class="container"><h1>BTC Activewear Sync</h1>
   <div class="grid">
     <div class="card">
@@ -706,11 +702,7 @@ app.get('/', (req, res) => {
       <button onclick="apiPost('/api/pause/toggle')" class="btn" ${failsafe.isTriggered?'disabled':''}>${isSystemPaused?'Resume':'Pause'}</button>
       ${failsafe.isTriggered?`<button onclick="apiPost('/api/failsafe/clear')" class="btn">Clear Failsafe</button>`:''}
       <div class="location-info">Location ID: ${config.shopify.locationIdNumber}</div>
-      <div class="supplier-info">Supplier Tag: ${config.btcactivewear.supplierTag}<br>FTP Host: ${config.ftp.host}<br>FTP User: ${config.ftp.user}</div>
-      <div class="debug">
-        <a class="btn" href="/api/debug/ftp" target="_blank">Test FTP + Preview</a>
-        <a class="btn" href="/api/debug/shopify" target="_blank">Test Shopify</a>
-      </div>
+      <div class="supplier-info">Supplier Tag: ${config.btcactivewear.supplierTag}<br>FTP Host: ${config.ftp.host}</div>
     </div>
     <div class="card">
       <h2>Inventory Sync</h2>
@@ -749,7 +741,7 @@ app.get('/', (req, res) => {
 // ============================================
 // SCHEDULED TASKS & STARTUP
 // ============================================
-cron.schedule('0 2 * * *', () => syncInventory()); // Daily at 2 AM (set TZ if needed)
+cron.schedule('0 2 * * *', () => syncInventory()); // Daily at 2 AM
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
