@@ -490,14 +490,19 @@ app.get('/', (req, res) => {
 });
 
 // ============================================
-// SCHEDULED TASKS & STARTUP
+// SCHEDULED TASKS & STARTUP - FIXED FOR RAILWAY
 // ============================================
 cron.schedule('0 2 * * *', () => syncInventory());  // Daily at 2 AM
 
 const PORT = process.env.PORT || 3000;
+
+// CRITICAL FIX: Bind to 0.0.0.0 for Railway
 app.listen(PORT, '0.0.0.0', () => {
     checkPauseStateOnStartup();
     addLog(`✅ BTC Activewear Sync Server started on port ${PORT} (Location: ${config.shopify.locationIdNumber})`, 'success');
+    console.log(`Server is listening on 0.0.0.0:${PORT}`);
+    console.log(`Railway deployment successful - server ready to accept connections`);
+    
     setTimeout(() => { 
         if (!isSystemLocked()) { 
             syncInventory(); 
