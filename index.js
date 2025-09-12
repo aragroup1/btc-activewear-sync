@@ -1,4 +1,3 @@
-// index.js
 const express = require('express');
 const ftp = require('basic-ftp');
 const csv = require('csv-parser');
@@ -13,7 +12,7 @@ require('dotenv').config();
 const app = express();
 app.use(express.json());
 
-// Request logging (helps during debugging)
+// Optional request logging
 app.use((req, res, next) => {
   console.log(`[REQ] ${req.method} ${req.url}`);
   next();
@@ -22,7 +21,7 @@ app.use((req, res, next) => {
 // Health check
 app.get('/health', (req, res) => res.status(200).send('ok'));
 
-// Optional API key for POST endpoints
+// Optional API key protection for POST endpoints
 const API_KEY = process.env.API_KEY || '';
 function requireApiKey(req, res, next) {
   if (!API_KEY) return next();
@@ -30,7 +29,7 @@ function requireApiKey(req, res, next) {
   return res.status(401).json({ error: 'Unauthorized' });
 }
 
-// File upload (kept for future)
+// Setup file upload (kept for future use)
 const upload = multer({
   dest: path.join(__dirname, 'uploads/'),
   limits: { fileSize: 500 * 1024 * 1024 }
@@ -49,11 +48,11 @@ const config = {
     baseUrl: `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2024-04`,
     graphqlUrl: `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2024-04/graphql.json`
   },
-  // Prefer BTC_* to avoid accidentally using old FTP_* vars
+  // BTC FTP - FIXED PASSWORD
   ftp: {
-    host: process.env.BTC_FTP_HOST || 'ftpdata.btcactivewear.co.uk',
-    user: process.env.BTC_FTP_USERNAME || 'ara0010',
-    password: process.env.BTC_FTP_PASSWORD || '',
+    host: process.env.FTP_HOST || process.env.BTC_FTP_HOST || 'ftpdata.btcactivewear.co.uk',
+    user: process.env.FTP_USERNAME || process.env.BTC_FTP_USERNAME || 'ara0010',
+    password: process.env.FTP_PASSWORD || process.env.BTC_FTP_PASSWORD || '87(fJrD5y<S6',  // Fixed password
     secure: false
   },
   btcactivewear: {
@@ -78,15 +77,17 @@ const config = {
   }
 };
 
-const requiredShopify = ['SHOPIFY_DOMAIN', 'SHOPIFY_ACCESS_TOKEN', 'SHOPIFY_LOCATION_ID'];
-const missingShopify = requiredShopify.filter(k => !process.env[k]);
-if (missingShopify.length) {
-  console.warn(`WARNING: Missing env vars: ${missingShopify.join(', ')}. UI will load, but sync will fail until these are set.`);
+const requiredConfig = ['SHOPIFY_DOMAIN', 'SHOPIFY_ACCESS_TOKEN', 'SHOPIFY_LOCATION_ID'];
+const missing = requiredConfig.filter(k => !process.env[k]);
+if (missing.length) {
+  console.warn(`WARNING: Missing env vars: ${missing.join(', ')}. UI will load, but sync will fail until these are set.`);
 }
 
 console.log(`Using Shopify Location ID: ${config.shopify.locationIdNumber}`);
 console.log(`BTC Activewear FTP Host: ${config.ftp.host}`);
-console.log(`[FTP] Using username: ${config.ftp.user}`);
+console.log(`BTC FTP User: ${config.ftp.user}`);
+// Don't log password for security, but show it's set
+console.log(`BTC FTP Password: ${config.ftp.password ? '***SET***' : 'NOT SET'}`);
 
 // ============================================
 // STATE MANAGEMENT & HELPERS
@@ -242,7 +243,7 @@ async function shopifyGraphQLRequest(query, variables) {
     if (response.data.errors) {
       throw new Error(JSON.stringify(response.data.errors));
     }
-    return response.data; // GraphQL payload
+    return response.data;
   } catch (error) {
     addLog(`GraphQL error: ${error.message}`, 'error');
     throw error;
@@ -252,6 +253,7 @@ async function shopifyGraphQLRequest(query, variables) {
 // Helpers
 const normalizeSku = s => (s || '').toString().trim().toUpperCase();
 const productHasTag = (product, tag) => {
+  // Shopify REST returns tags as a comma-delimited string
   const tagStr = (product?.tags || '').toString();
   return new Set(tagStr.split(',').map(t => t.trim())).has(tag);
 };
@@ -265,14 +267,14 @@ const sample = (arr, n = 10) => arr.slice(0, n);
 async function fetchInventoryFromFTP() {
   const client = new ftp.Client();
   try {
-    if (!config.ftp.host || !config.ftp.user || !config.ftp.password) {
-      throw new Error('FTP credentials missing: ensure BTC_FTP_HOST, BTC_FTP_USERNAME, BTC_FTP_PASSWORD are set.');
-    }
+    addLog(`Connecting to FTP: ${config.ftp.host} as ${config.ftp.user}...`, 'info');
     await client.access(config.ftp);
+    addLog(`FTP connected successfully. Downloading ${config.btcactivewear.stockFilePath}...`, 'info');
     const chunks = [];
     await client.downloadTo(new Writable({
       write(c, e, cb) { chunks.push(c); cb(); }
     }), config.btcactivewear.stockFilePath);
+    addLog(`FTP download completed successfully.`, 'success');
     return Readable.from(Buffer.concat(chunks));
   } catch (e) {
     addLog(`FTP error: ${e.message}`, 'error');
@@ -282,29 +284,7 @@ async function fetchInventoryFromFTP() {
   }
 }
 
-// Debug-only: quick FTP test (login + file size)
-async function testFtpConnection() {
-  const client = new ftp.Client();
-  try {
-    await client.access(config.ftp);
-    let size = null;
-    try {
-      size = await client.size(config.btcactivewear.stockFilePath);
-    } catch {
-      // No SIZE support or path issue; list directory
-      const dir = path.posix.dirname(config.btcactivewear.stockFilePath);
-      const list = await client.list(dir);
-      return { connected: true, fileSize: null, dir, dirListing: list.slice(0, 20) };
-    }
-    return { connected: true, fileSize: size };
-  } catch (e) {
-    return { connected: false, error: e.message, host: config.ftp.host, user: config.ftp.user };
-  } finally {
-    client.close();
-  }
-}
-
-// Robust parser for BTC CSV
+// Robust parser for BTC: "Stock ID", "Remaining_Stock*"
 async function parseInventoryCSV(stream) {
   return new Promise((resolve, reject) => {
     const inventory = new Map();
@@ -332,7 +312,7 @@ async function parseInventoryCSV(stream) {
 
 async function getAllShopifyProducts() {
   let allProducts = [];
-  let url = `/products.json?limit=250`;
+  let url = `/products.json?limit=250`; // full variants with inventory_item_id, sku, etc.
   addLog('Fetching all Shopify products...', 'info');
   while (url) {
     try {
@@ -356,7 +336,8 @@ async function getAllShopifyProducts() {
   return allProducts;
 }
 
-// Per-location availability
+// Fetch per-location availability for inventory items (REST)
+// Shopify allows up to ~50 inventory_item_ids per call; we'll chunk to 50.
 async function getAvailableAtLocationMap(inventoryItemIds, locationIdNumber) {
   const chunkSize = 50;
   const result = new Map();
@@ -406,18 +387,14 @@ async function sendInventoryUpdatesInBatches(adjustments, reason) {
       }`;
 
     try {
-      const resp = await shopifyGraphQLRequest(mutation, {
+      await shopifyGraphQLRequest(mutation, {
         input: {
           name: 'btc_stock_update',
           reason,
           changes: batch
         }
       });
-      const userErrors = resp?.data?.inventoryAdjustQuantities?.userErrors || [];
-      if (userErrors.length) {
-        addLog(`   ⚠️ Shopify userErrors (${userErrors.length}): ${userErrors.slice(0, 5).map(e => e.message).join(' | ')}`, 'warning');
-      }
-      addLog(`   ✅ Batch ${currentBatchNum} processed.`, 'success');
+      addLog(`   ✅ Batch ${currentBatchNum} processed successfully.`, 'success');
     } catch (error) {
       addLog(`   ❌ Error processing batch ${currentBatchNum}: ${error.message}`, 'error');
       throw error;
@@ -472,8 +449,8 @@ async function syncInventory() {
     addLog('Sync skipped: System is locked.', 'warning');
     return;
   }
-  if (missingShopify.length) {
-    addLog(`Cannot run sync: missing env vars: ${missingShopify.join(', ')}`, 'error');
+  if (missing.length) {
+    addLog(`Cannot run sync: missing env vars: ${missing.join(', ')}`, 'error');
     return;
   }
 
@@ -484,20 +461,21 @@ async function syncInventory() {
   try {
     const startTime = Date.now();
 
-    // 1) FTP fetch + parse
+    // 1) Fetch + parse FTP
     const ftpStream = await fetchInventoryFromFTP();
     const ftpInventory = await parseInventoryCSV(ftpStream);
     addLog(`Successfully fetched and parsed ${ftpInventory.size} Stock IDs from BTC Activewear FTP.`, 'success');
 
-    // 2) Shopify products
+    // 2) Fetch Shopify products
     const shopifyProducts = await getAllShopifyProducts();
 
-    // 3) Discontinuations
+    // 3) Discontinue missing products (based on any variant presence)
     const discontinuedCount = await processAutomatedDiscontinuations(ftpInventory, shopifyProducts);
     runResult.discontinued = discontinuedCount;
 
-    // 4) Mapping diagnostics
+    // 4) Build mapping stats and fetch per-location levels
     const btcProducts = shopifyProducts.filter(p => p.status === 'active' && productHasTag(p, config.btcactivewear.supplierTag));
+
     const btcVariants = btcProducts.flatMap(p => p.variants || []);
     const totalVariants = btcVariants.length;
 
@@ -508,20 +486,28 @@ async function syncInventory() {
     for (const v of btcVariants) {
       const sku = normalizeSku(v.sku);
       if (!sku) continue;
-      if (ftpInventory.has(sku)) matchedVariants.push(v);
-      else unmatchedSkus.push(sku);
-      if (v.inventory_management !== 'shopify') notTrackedCount++;
+      if (ftpInventory.has(sku)) {
+        matchedVariants.push(v);
+      } else {
+        unmatchedSkus.push(sku);
+      }
+      if (v.inventory_management !== 'shopify') {
+        notTrackedCount++;
+      }
     }
 
     addLog(`[MAP] BTC products: ${btcProducts.length}, variants: ${totalVariants}`, 'info');
     addLog(`[MAP] Matched SKUs: ${matchedVariants.length}, Unmatched SKUs: ${unmatchedSkus.length}`, 'info');
-    if (unmatchedSkus.length > 0) addLog(`[MAP] Sample unmatched SKUs: ${sample(unique(unmatchedSkus), 10).join(', ')}`, 'warning');
-    if (notTrackedCount > 0) addLog(`[MAP] Variants not tracked by Shopify: ${notTrackedCount}`, 'warning');
+    if (unmatchedSkus.length > 0) {
+      addLog(`[MAP] Sample unmatched SKUs: ${sample(unique(unmatchedSkus), 10).join(', ')}`, 'warning');
+    }
+    addLog(`[MAP] Variants not tracked by Shopify (inventory_management != 'shopify'): ${notTrackedCount}`, 'warning');
 
-    // 5) Location-level compare
+    // Get current availability at the configured location for matched variants
     const inventoryItemIds = unique(matchedVariants.map(v => String(v.inventory_item_id)));
     const availableMap = await getAvailableAtLocationMap(inventoryItemIds, config.shopify.locationIdNumber);
 
+    // 5) Compare and prepare adjustments at location
     const adjustments = [];
     let sameCount = 0;
     const diffSamples = [];
@@ -533,29 +519,36 @@ async function syncInventory() {
       const currentAvail = availableMap.get(invItemIdStr) ?? 0;
 
       if (ftpQty !== currentAvail) {
-        const delta = ftpQty - currentAvail;
         adjustments.push({
           inventoryItemId: `gid://shopify/InventoryItem/${invItemIdStr}`,
           locationId: config.shopify.locationId,
-          delta
+          delta: ftpQty - currentAvail
         });
-        if (diffSamples.length < 15) diffSamples.push(`${sku}: FTP=${ftpQty}, LocationAvail=${currentAvail}, Δ=${delta}`);
+
+        if (diffSamples.length < 15) {
+          diffSamples.push(`${sku}: FTP=${ftpQty}, LocationAvail=${currentAvail}, Δ=${ftpQty - currentAvail}`);
+        }
       } else {
         sameCount++;
       }
     }
 
-    addLog(`[COMPARE] Location-level comparisons: Same=${sameCount}, Different=${adjustments.length}`, 'info');
-    if (diffSamples.length > 0) addLog(`[COMPARE] Example differences: ${diffSamples.join(' | ')}`, 'info');
+    addLog(`[COMPARE] Location-level comparisons complete. Same: ${sameCount}, Different: ${adjustments.length}`, 'info');
+    if (diffSamples.length > 0) {
+      addLog(`[COMPARE] Example differences: ${diffSamples.join(' | ')}`, 'info');
+    }
 
-    // 6) Update
+    // 6) Send updates
     await sendInventoryUpdatesInBatches(adjustments, 'stock_sync');
     runResult.updated = adjustments.length;
 
-    if (adjustments.length > 0) addLog(`✅ Successfully sent bulk inventory updates for ${adjustments.length} variants.`, 'success');
-    else addLog('ℹ️ No inventory updates were needed (at the configured location).', 'info');
+    if (adjustments.length > 0) {
+      addLog(`✅ Successfully sent bulk inventory updates for ${adjustments.length} variants.`, 'success');
+    } else {
+      addLog('ℹ️ No inventory updates were needed (at the configured location).', 'info');
+    }
 
-    // 7) Done
+    // 7) Finish
     runResult.status = 'completed';
     const duration = ((Date.now() - startTime) / 1000).toFixed(2);
     const summary = `BTC Activewear sync ${runResult.status} in ${duration}s:
@@ -577,17 +570,6 @@ async function syncInventory() {
 // ============================================
 // API Endpoints
 // ============================================
-app.get('/api/debug/ftp', async (req, res) => {
-  const result = await testFtpConnection();
-  res.json({
-    ok: result.connected,
-    ...result,
-    // don’t expose password
-    host: config.ftp.host,
-    user: config.ftp.user
-  });
-});
-
 app.post('/api/sync/inventory', requireApiKey, (req, res) => {
   syncInventory();
   res.json({ success: true });
@@ -634,8 +616,7 @@ app.get('/', (req, res) => {
       <button onclick="apiPost('/api/pause/toggle')" class="btn" ${failsafe.isTriggered?'disabled':''}>${isSystemPaused?'Resume':'Pause'}</button>
       ${failsafe.isTriggered?`<button onclick="apiPost('/api/failsafe/clear')" class="btn">Clear Failsafe</button>`:''}
       <div class="location-info">Location ID: ${config.shopify.locationIdNumber}</div>
-      <div class="supplier-info">Supplier Tag: ${config.btcactivewear.supplierTag}<br>FTP Host: ${config.ftp.host}<br>FTP User: ${config.ftp.user}</div>
-      <div style="margin-top:8px"><a class="btn" href="/api/debug/ftp" target="_blank">Test FTP</a></div>
+      <div class="supplier-info">Supplier Tag: ${config.btcactivewear.supplierTag}<br>FTP Host: ${config.ftp.host}</div>
     </div>
     <div class="card">
       <h2>Inventory Sync</h2>
@@ -674,7 +655,7 @@ app.get('/', (req, res) => {
 // ============================================
 // SCHEDULED TASKS & STARTUP
 // ============================================
-cron.schedule('0 2 * * *', () => syncInventory()); // Daily at 2 AM
+cron.schedule('0 2 * * *', () => syncInventory()); // Daily at 2 AM (set TZ=Europe/London in env)
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
