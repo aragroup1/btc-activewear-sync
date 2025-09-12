@@ -495,7 +495,7 @@ app.get('/', (req, res) => {
 cron.schedule('0 2 * * *', () => syncInventory());  // Daily at 2 AM
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
     checkPauseStateOnStartup();
     addLog(`✅ BTC Activewear Sync Server started on port ${PORT} (Location: ${config.shopify.locationIdNumber})`, 'success');
     setTimeout(() => { 
