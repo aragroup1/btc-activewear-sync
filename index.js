@@ -40,8 +40,8 @@ const config = {
     },
     btcactivewear: { 
         maxInventory: parseInt(process.env.MAX_INVENTORY || '100'),
-        supplierTag: 'Source_BTC Activewear',  // Changed from Supplier:Ralawise
-        stockFilePath: '/webdata/stock_levels_stock_id.csv'  // New file path
+        supplierTag: 'Source_BTC Activewear',
+        stockFilePath: '/webdata/stock_levels_stock_id.csv'
     },
     telegram: { 
         botToken: process.env.TELEGRAM_BOT_TOKEN, 
@@ -53,6 +53,10 @@ const config = {
     rateLimit: {
         requestsPerSecond: 2,
         burstSize: 40
+    },
+    debug: {
+        enabled: process.env.DEBUG_MODE === 'true' || true, // Enable debug by default
+        sampleSize: 10 // Show sample SKUs in logs
     }
 };
 
@@ -224,7 +228,6 @@ async function fetchInventoryFromFTP() {
     try { 
         await client.access(config.ftp); 
         const chunks = []; 
-        // Updated path for BTC Activewear
         await client.downloadTo(new Writable({ 
             write(c, e, cb) { chunks.push(c); cb(); } 
         }), config.btcactivewear.stockFilePath); 
@@ -237,26 +240,44 @@ async function fetchInventoryFromFTP() {
     } 
 }
 
-// UPDATED: Parse BTC Activewear CSV format
 async function parseInventoryCSV(stream) { 
     return new Promise((resolve, reject) => { 
         const inventory = new Map(); 
+        let rowCount = 0;
+        const sampleStockIds = [];
+        
         stream
             .pipe(csv({
-                // BTC Activewear headers: Stock ID, Product Code, Remaining_Stock*
                 headers: ['Stock_ID', 'Product_Code', 'Remaining_Stock'],
                 skipLines: 1
             }))
             .on('data', row => { 
-                // Use Stock_ID as the SKU mapping (as per requirement)
+                rowCount++;
                 if (row.Stock_ID) {
                     const stockId = row.Stock_ID.trim();
                     const quantity = parseInt(row.Remaining_Stock) || 0;
                     inventory.set(stockId, Math.min(quantity, config.btcactivewear.maxInventory));
+                    
+                    // Collect sample Stock IDs for debugging
+                    if (sampleStockIds.length < config.debug.sampleSize) {
+                        sampleStockIds.push({
+                            stockId: stockId,
+                            productCode: row.Product_Code?.trim(),
+                            quantity: quantity
+                        });
+                    }
                 }
             })
             .on('end', () => {
-                addLog(`Parsed ${inventory.size} Stock IDs from BTC Activewear CSV`, 'info');
+                addLog(`Parsed ${inventory.size} Stock IDs from ${rowCount} rows in BTC Activewear CSV`, 'info');
+                
+                if (config.debug.enabled) {
+                    addLog(`Sample Stock IDs from FTP:`, 'debug');
+                    sampleStockIds.forEach(item => {
+                        addLog(`  Stock ID: ${item.stockId}, Product Code: ${item.productCode}, Qty: ${item.quantity}`, 'debug');
+                    });
+                }
+                
                 resolve(inventory);
             })
             .on('error', reject); 
@@ -312,7 +333,7 @@ async function sendInventoryUpdatesInBatches(adjustments, reason) {
         try {
             await shopifyGraphQLRequest(mutation, { 
                 input: {
-                    name: "btc_stock_update",  // Changed name
+                    name: "btc_stock_update",
                     reason: reason,
                     changes: batch
                 }
@@ -325,19 +346,33 @@ async function sendInventoryUpdatesInBatches(adjustments, reason) {
     }
 }
 
-// UPDATED: Check for BTC Activewear supplier tag
 async function processAutomatedDiscontinuations(ftpInventory, allShopifyProducts) {
     addLog('Starting automated discontinuation process...', 'info');
     let discontinuedCount = 0;
     const ftpSkuSet = new Set(ftpInventory.keys());
-    // Updated to use BTC Activewear supplier tag
+    
     const productsToCheck = allShopifyProducts.filter(p => 
         p.tags.includes(config.btcactivewear.supplierTag) && p.status === 'active'
     );
     addLog(`Found ${productsToCheck.length} active '${config.btcactivewear.supplierTag}' products to check.`, 'info');
 
+    // Debug: Show sample Shopify SKUs for BTC products
+    if (config.debug.enabled && productsToCheck.length > 0) {
+        addLog(`Sample Shopify SKUs for BTC products:`, 'debug');
+        let sampleCount = 0;
+        for (const product of productsToCheck.slice(0, 3)) {
+            for (const variant of product.variants.slice(0, 2)) {
+                if (variant.sku) {
+                    addLog(`  Product: ${product.title}, SKU: ${variant.sku}, Qty: ${variant.inventory_quantity}`, 'debug');
+                    sampleCount++;
+                    if (sampleCount >= 5) break;
+                }
+            }
+            if (sampleCount >= 5) break;
+        }
+    }
+
     for (const product of productsToCheck) {
-        // Check if any variant SKU matches a Stock ID from the FTP file
         const isProductInFtp = product.variants.some(v => ftpSkuSet.has(v.sku?.trim()));
 
         if (!isProductInFtp) {
@@ -383,7 +418,7 @@ async function syncInventory() {
     }
     isRunning.inventory = true;
     addLog('🚀 Starting BTC Activewear inventory sync process...', 'info');
-    let runResult = { type: 'Inventory Sync', status: 'failed', updated: 0, discontinued: 0, errors: 0 };
+    let runResult = { type: 'Inventory Sync', status: 'failed', updated: 0, discontinued: 0, errors: 0, matched: 0, btcProducts: 0 };
 
     try {
         const startTime = Date.now();
@@ -397,24 +432,62 @@ async function syncInventory() {
 
         addLog('Starting inventory level updates for remaining products...', 'info');
         const inventoryAdjustments = [];
+        let matchedVariants = 0;
+        let btcProductCount = 0;
+        let btcVariantCount = 0;
+        let skuMismatches = [];
         
         for (const product of shopifyProducts) {
-            // Check for BTC Activewear supplier tag
             if (product.status !== 'active' || !product.tags.includes(config.btcactivewear.supplierTag)) continue;
+            
+            btcProductCount++;
             for (const variant of product.variants) {
-                const sku = variant.sku?.trim();  // Stock ID is mapped to SKU
-                if (sku && ftpInventory.has(sku)) {
-                    const ftpQuantity = ftpInventory.get(sku);
-                    const shopifyQuantity = variant.inventory_quantity;
-                    if (ftpQuantity !== shopifyQuantity) {
-                        inventoryAdjustments.push({
-                            inventoryItemId: `gid://shopify/InventoryItem/${variant.inventory_item_id}`,
-                            locationId: config.shopify.locationId,
-                            delta: ftpQuantity - shopifyQuantity
+                btcVariantCount++;
+                const sku = variant.sku?.trim();
+                
+                if (sku) {
+                    if (ftpInventory.has(sku)) {
+                        matchedVariants++;
+                        const ftpQuantity = ftpInventory.get(sku);
+                        const shopifyQuantity = variant.inventory_quantity || 0;
+                        
+                        if (ftpQuantity !== shopifyQuantity) {
+                            inventoryAdjustments.push({
+                                inventoryItemId: `gid://shopify/InventoryItem/${variant.inventory_item_id}`,
+                                locationId: config.shopify.locationId,
+                                delta: ftpQuantity - shopifyQuantity
+                            });
+                            
+                            // Log first few updates for debugging
+                            if (inventoryAdjustments.length <= 5) {
+                                addLog(`  Update: SKU ${sku} from ${shopifyQuantity} to ${ftpQuantity} (delta: ${ftpQuantity - shopifyQuantity})`, 'debug');
+                            }
+                        }
+                    } else if (skuMismatches.length < 5) {
+                        // Track unmatched SKUs for debugging
+                        skuMismatches.push({
+                            product: product.title,
+                            sku: sku
                         });
                     }
                 }
             }
+        }
+        
+        runResult.btcProducts = btcProductCount;
+        runResult.matched = matchedVariants;
+        
+        addLog(`📊 Matching Summary:`, 'info');
+        addLog(`  - BTC products in Shopify: ${btcProductCount}`, 'info');
+        addLog(`  - BTC variants in Shopify: ${btcVariantCount}`, 'info');
+        addLog(`  - Variants matched with FTP: ${matchedVariants}`, 'info');
+        addLog(`  - Inventory updates needed: ${inventoryAdjustments.length}`, 'info');
+        
+        if (config.debug.enabled && skuMismatches.length > 0) {
+            addLog(`Sample unmatched Shopify SKUs (not in FTP):`, 'debug');
+            skuMismatches.forEach(item => {
+                addLog(`  Product: ${item.product}, SKU: ${item.sku}`, 'debug');
+            });
         }
         
         await sendInventoryUpdatesInBatches(inventoryAdjustments, 'stock_sync');
@@ -428,7 +501,7 @@ async function syncInventory() {
 
         runResult.status = 'completed';
         const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-        const summary = `BTC Activewear sync ${runResult.status} in ${duration}s:\n🔄 ${runResult.updated} variants updated\n🗑️ ${runResult.discontinued} products discontinued`;
+        const summary = `BTC Activewear sync ${runResult.status} in ${duration}s:\n🔄 ${runResult.updated} variants updated\n🎯 ${runResult.matched} variants matched\n🗑️ ${runResult.discontinued} products discontinued`;
         addLog(summary, 'success');
         notifyTelegram(summary);
 
@@ -464,27 +537,66 @@ app.post('/api/failsafe/clear', (req, res) => {
     res.json({ success: true }); 
 });
 
+// Debug endpoint to check SKU mappings
+app.get('/api/debug/skus', async (req, res) => {
+    try {
+        const ftpStream = await fetchInventoryFromFTP();
+        const ftpInventory = await parseInventoryCSV(ftpStream);
+        const shopifyProducts = await getAllShopifyProducts();
+        
+        const btcProducts = shopifyProducts.filter(p => 
+            p.tags.includes(config.btcactivewear.supplierTag) && p.status === 'active'
+        );
+        
+        const ftpSample = Array.from(ftpInventory.keys()).slice(0, 10);
+        const shopifySample = [];
+        
+        for (const product of btcProducts.slice(0, 5)) {
+            for (const variant of product.variants.slice(0, 2)) {
+                if (variant.sku) {
+                    shopifySample.push({
+                        product: product.title,
+                        sku: variant.sku,
+                        inFtp: ftpInventory.has(variant.sku.trim())
+                    });
+                }
+            }
+        }
+        
+        res.json({
+            ftpStockIds: ftpSample,
+            shopifySkus: shopifySample,
+            ftpTotal: ftpInventory.size,
+            btcProductsTotal: btcProducts.length
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // ============================================
 // WEB INTERFACE - Updated for BTC Activewear
 // ============================================
 app.get('/', (req, res) => {
     const lastInventorySync = runHistory.find(r => r.type === 'Inventory Sync');
     
-    const html = `<!DOCTYPE html><html lang="en"><head><title>BTC Activewear Sync</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0d1117;color:#c9d1d9;margin:0;line-height:1.5;}.container{max-width:1400px;margin:auto;padding:1rem;}.card{background:#161b22;border:1px solid #30363d;padding:1.5rem;border-radius:6px;margin-bottom:1rem;}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1rem;}.btn{padding:0.5rem 1rem;border:1px solid #30363d;border-radius:6px;cursor:pointer;background:#21262d;color:#c9d1d9;font-weight:600;}.btn-primary{background:#238636;color:white;border-color:#2ea043;}.btn:disabled{opacity:0.5;cursor:not-allowed;}.logs{background:#010409;padding:1rem;height:300px;overflow-y:auto;border-radius:6px;font-family:monospace;white-space:pre-wrap;font-size:0.875em;}.alert-warning{background-color:rgba(210,149,34,0.1);border-color:#d29922;padding:1rem;border-radius:6px;margin-bottom:1rem;border:1px solid;}.stat-card{text-align:center;}.stat-value{font-size:2rem;font-weight:600;}.stat-label{font-size:0.8rem;color:#8b949e;}.location-info{font-size:0.875em;color:#8b949e;margin-top:0.5rem;}.supplier-info{background:rgba(56,139,253,0.1);border:1px solid #388bfd;padding:0.5rem;border-radius:4px;margin-top:0.5rem;font-size:0.875em;}</style></head><body><div class="container"><h1>BTC Activewear Sync</h1>
+    const html = `<!DOCTYPE html><html lang="en"><head><title>BTC Activewear Sync</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0d1117;color:#c9d1d9;margin:0;line-height:1.5;}.container{max-width:1400px;margin:auto;padding:1rem;}.card{background:#161b22;border:1px solid #30363d;padding:1.5rem;border-radius:6px;margin-bottom:1rem;}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1rem;}.btn{padding:0.5rem 1rem;border:1px solid #30363d;border-radius:6px;cursor:pointer;background:#21262d;color:#c9d1d9;font-weight:600;}.btn-primary{background:#238636;color:white;border-color:#2ea043;}.btn:disabled{opacity:0.5;cursor:not-allowed;}.logs{background:#010409;padding:1rem;height:300px;overflow-y:auto;border-radius:6px;font-family:monospace;white-space:pre-wrap;font-size:0.875em;}.alert-warning{background-color:rgba(210,149,34,0.1);border-color:#d29922;padding:1rem;border-radius:6px;margin-bottom:1rem;border:1px solid;}.stat-card{text-align:center;}.stat-value{font-size:2rem;font-weight:600;}.stat-label{font-size:0.8rem;color:#8b949e;}.location-info{font-size:0.875em;color:#8b949e;margin-top:0.5rem;}.supplier-info{background:rgba(56,139,253,0.1);border:1px solid #388bfd;padding:0.5rem;border-radius:4px;margin-top:0.5rem;font-size:0.875em;}.debug-btn{background:#1f6feb;border-color:#388bfd;margin-top:0.5rem;}</style></head><body><div class="container"><h1>BTC Activewear Sync</h1>
     <div class="grid">
-        <div class="card"><h2>System</h2><p>Status: ${isSystemPaused?'Paused':failsafe.isTriggered?'FAILSAFE': Object.values(isRunning).some(v => v) ? 'Busy' : 'Active'}</p><button onclick="apiPost('/api/pause/toggle')" class="btn" ${failsafe.isTriggered?'disabled':''}>${isSystemPaused?'Resume':'Pause'}</button>${failsafe.isTriggered?`<button onclick="apiPost('/api/failsafe/clear')" class="btn">Clear Failsafe</button>`:''}<div class="location-info">Location ID: ${config.shopify.locationIdNumber}</div><div class="supplier-info">Supplier Tag: ${config.btcactivewear.supplierTag}<br>FTP Host: ${config.ftp.host}</div></div>
+        <div class="card"><h2>System</h2><p>Status: ${isSystemPaused?'Paused':failsafe.isTriggered?'FAILSAFE': Object.values(isRunning).some(v => v) ? 'Busy' : 'Active'}</p><button onclick="apiPost('/api/pause/toggle')" class="btn" ${failsafe.isTriggered?'disabled':''}>${isSystemPaused?'Resume':'Pause'}</button>${failsafe.isTriggered?`<button onclick="apiPost('/api/failsafe/clear')" class="btn">Clear Failsafe</button>`:''}<div class="location-info">Location ID: ${config.shopify.locationIdNumber}</div><div class="supplier-info">Supplier Tag: ${config.btcactivewear.supplierTag}<br>FTP Host: ${config.ftp.host}</div><button onclick="window.open('/api/debug/skus','_blank')" class="btn debug-btn">Debug SKU Mapping</button></div>
         <div class="card"><h2>Inventory Sync</h2><p>Status: ${isRunning.inventory?'Running':'Ready'}</p><p>Syncs stock levels and <b>automatically discontinues</b> products not in the FTP file.</p><button onclick="apiPost('/api/sync/inventory','Run inventory sync?')" class="btn btn-primary" ${isSystemLocked()?'disabled':''}>Run Now</button></div>
     </div>
     <div class="card">
         <h2>Last Inventory Sync</h2>
-        <div class="grid" style="grid-template-columns:1fr 1fr;">
+        <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));">
             <div class="stat-card"><div class="stat-value">${lastInventorySync?.updated ?? 'N/A'}</div><div class="stat-label">Variants Updated</div></div>
-            <div class="stat-card"><div class="stat-value">${lastInventorySync?.discontinued ?? 'N/A'}</div><div class="stat-label">Products Discontinued</div></div>
+            <div class="stat-card"><div class="stat-value">${lastInventorySync?.matched ?? 'N/A'}</div><div class="stat-label">Variants Matched</div></div>
+            <div class="stat-card"><div class="stat-value">${lastInventorySync?.btcProducts ?? 'N/A'}</div><div class="stat-label">BTC Products</div></div>
+            <div class="stat-card"><div class="stat-value">${lastInventorySync?.discontinued ?? 'N/A'}</div><div class="stat-label">Discontinued</div></div>
         </div>
     </div>
-    <div class="card"><h2>Logs</h2><div class="logs">${logs.map(log=>`<div class="log-entry log-${log.type}">[${new Date(log.timestamp).toLocaleTimeString()}] ${log.message}</div>`).join('')}</div></div>
+    <div class="card"><h2>Logs</h2><div class="logs">${logs.map(log=>`<div class="log-entry log-${log.type}" style="color:${log.type==='debug'?'#58a6ff':log.type==='error'?'#f85149':log.type==='success'?'#3fb950':log.type==='warning'?'#d29922':'#c9d1d9'}">[${new Date(log.timestamp).toLocaleTimeString()}] ${log.message}</div>`).join('')}</div></div>
     </div><script>
-    async function apiPost(url,confirmMsg){if(confirmMsg&&!confirm(confirmMsg))return;try{const btn=event.target;if(btn)btn.disabled=true;await fetch(url,{method:'POST'});setTimeout(()=>location.reload(),500)}catch(e){alert('Upload error: '+e.message);if(btn)btn.disabled=false;location.reload();}}
+    async function apiPost(url,confirmMsg){if(confirmMsg&&!confirm(confirmMsg))return;try{const btn=event.target;if(btn)btn.disabled=true;await fetch(url,{method:'POST'});setTimeout(()=>location.reload(),500)}catch(e){alert('Error: '+e.message);if(btn)btn.disabled=false;location.reload();}}
     </script></body></html>`;
     res.send(html);
 });
